@@ -4,7 +4,7 @@ import sets
 export sets
 import tables
 export tables
-import strutils
+import strutils except dedent
 import hashes
 import os
 export os
