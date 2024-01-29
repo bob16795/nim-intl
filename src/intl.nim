@@ -37,7 +37,7 @@ proc computeHash(s:string):int =
   result = (($hash(s)).substr(0,4).alignLeft(5, '0')).parseInt()
 
 proc computeHash(node:NimNode):int {.compileTime.} =
-  computeHash($node.toStrLit())
+  computeHash(node.repr())
 
 proc generateKey*(x:string):string {.compileTime.} =
   ## Given a translation string, generate a unique, but
@@ -70,9 +70,14 @@ template intlCatalog*(name:string) =
   var extracted_messages {.compileTime, genSym.} = newOrderedTable[string,NimNode]()
   var base_message_tab {.compileTime, genSym.} = newOrderedTable[string,NimNode]()
   var locale_messages {.compileTime, genSym.} = newOrderedTable[string,seq[LocaleMessage]]()
+  var locale_progress {.compileTime, genSym.} = newOrderedTable[string,float]()
+  var locale_names {.compileTime, genSym.} = newSeq[string]()
   let message_type_name {.compileTime, genSym.} = "Messages_" & name
   let selectedMessages_varname {.compileTime, genSym.} = "selectedMessages_" & name
   let chooser_table_varname {.compileTime, genSym.} = "localeChoosers_" & name
+
+  proc getLocales*(): seq[string] =
+    locale_names
 
   proc handleTr(key:string, message:NimNode):NimNode {.compileTime.} =
     ## Generate the NimNode that will become the localised value
@@ -97,7 +102,7 @@ template intlCatalog*(name:string) =
 
   macro tr*(message:untyped):untyped =
     ## TODO
-    let sanikey = generateKey($(message.copyNimTree().toStrLit()))
+    let sanikey = generateKey(message.copyNimTree().repr())
     handleTr(sanikey, message.copyNimTree())
 
   proc setLocaleMacro(locale:NimNode):NimNode =
@@ -141,10 +146,10 @@ template intlCatalog*(name:string) =
         newLit($k),
         v,
       ))
-    let baseMessages_string = $nnkCall.newTree(
+    let baseMessages_string = nnkCall.newTree(
       newIdentNode("baseMessages"),
       nnkStmtList.newTree(baseMessages),
-    ).toStrLit()
+    ).repr()
     postludeParts.add(baseMessages_string)
     
     if autoDir != "":
@@ -152,19 +157,26 @@ template intlCatalog*(name:string) =
       import intl
       export intl
       intlCatalog """ & "\"" & name & "\"\L" & """
-      """) & baseMessages_string)
+      """) & baseMessages_string.replace(" do:", ":"))
       echo "intl: wrote " & autoSubDir/"base.nim"
       let nimfiles = utilityCall("ls", autoDir).output.splitLines()
       for filename in nimfiles:
+        if filename.splitFile().ext != "nim": continue
+        if dirExists(filename): continue
+
         let locale_name = filename.changeFileExt("")
         if locale_name != "base" and locale_name != "all":
           if not locale_messages.hasKey(locale_name):
             locale_messages[locale_name] = newSeq[LocaleMessage]()
 
     # Generate an updated locale messages block
-    for locale,messages in locale_messages.pairs:
-      var words:seq[NimNode]
+    for locale, messages in locale_messages.pairs:
+      var counts: array[MessageStatus, int]
+      var words: seq[NimNode]
       var encountered = initHashSet[string]()
+
+      locale_names &= locale
+
       # Existing translations
       for message in messages:
         var status = "todo"
@@ -173,6 +185,8 @@ template intlCatalog*(name:string) =
         of Done: status = "done"
         of Todo: status = "todo"
         of Redo: status = "redo"
+
+        counts[message.status] += 1
 
         var hashval:int = message.hashval
         var comment:string
@@ -183,7 +197,9 @@ template intlCatalog*(name:string) =
             # The key is the same, but the string has changed.
             # Mark this as needing to be rechecked
             status = "redo"
-            comment = "New value: " & $extracted_messages[message.key].toStrLit()
+            comment = "New value: " & extracted_messages[message.key].repr()
+          if status == "gone":
+            status = "todo"
         else:
           status = "gone"
 
@@ -195,8 +211,8 @@ template intlCatalog*(name:string) =
         ))
         if comment != "":
           words.add(newCommentStmtNode(comment))
-      
-      # Newly extracted messages 
+
+      # Newly extracted messages
       for k,v in extracted_messages.pairs:
         if k in encountered:
           continue
@@ -207,20 +223,22 @@ template intlCatalog*(name:string) =
           v,
         ))
       
-      let localeMessages_string = $nnkCommand.newTree(
+      let localeMessages_string = nnkCommand.newTree(
         newIdentNode("messages"),
         newLit(locale),
         nnkStmtList.newTree(words),
-      ).toStrLit()
+      ).repr()
       postludeParts.add ""
       postludeParts.add localeMessages_string
       if autoDir != "":
         let filename = autoDir/locale & ".nim"
         writeFile(filename, dedent"""
         import ./base
-        """ & localeMessages_string)
+        """ & localeMessages_string.replace(" do:", ":"))
         echo "intl: wrote " & autoSubDir/filename.extractFilename()
-    
+
+      locale_progress[locale] = counts[Done].float / (counts[Redo] + counts[Done] + counts[Todo]).float
+
     if autoDir != "":
       var guts = dedent"""
       import intl
@@ -231,10 +249,17 @@ template intlCatalog*(name:string) =
       for locale in locale_messages.keys:
         guts.add("import ./" & locale & "\l")
 
-      writeFile(autoDir/"all.nim", guts)
+      writeFile(autoDir / "all.nim", guts)
       echo "intl: wrote " & autoSubDir/"all.nim"
     postludeParts.add "## ==== end intl postlude ===="
     echo postludeParts.join("\l")
+
+    var conts = ""
+    conts &= "Lang Progress dump\n"
+    conts &= "==================\n"
+    for m in locale_names:
+      conts &= $m & (" ".repeat(9 - m.len)) & " - " & $((int(locale_progress[m] * 10000).float32) / 100) & "%\n"
+    writeFile(autoDir / "progress.txt", conts)
 
   template intlPostlude*(callingSrcPath = "", autoDir = "") =
     ## Execute the intl postlude.  Call this at the very end
@@ -409,12 +434,11 @@ template intlCatalog*(name:string) =
       )
     mkMessageGenerator()
 
-
 when isMainModule:
   import strutils
   import sequtils
   # intl utility
-  proc getArg():string {.inline.} =
+  proc getArg(): string {.inline.} =
     stdin.readAll()
   let cmd = paramStr(1)
   case cmd
@@ -476,7 +500,7 @@ when isMainModule:
     let transdir = "."/"trans"
     let locale = paramStr(2)
     let locale_file = transdir / locale & ".nim"
-    if not locale_file.existsFile:
+    if not locale_file.fileExists:
       writeFile(locale_file, dedent("""
       import ./base
 
